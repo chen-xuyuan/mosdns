@@ -20,12 +20,14 @@
 package udp_server
 
 import (
+	"context"
 	"fmt"
+	"net"
+
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/server"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/IrineSistiana/mosdns/v5/plugin/server/server_utils"
-	"net"
 )
 
 const PluginType = "udp_server"
@@ -65,7 +67,10 @@ func StartServer(bp *coremain.BP, args *Args) (*UdpServer, error) {
 
 	serverOpts := server.UDPServerOpts{Logger: bp.L(), DNSHandler: dh}
 	s := server.NewUDPServer(serverOpts)
-	c, err := net.ListenPacket("udp", args.Listen)
+	lc := net.ListenConfig{
+		Control: udpListenControl,
+	}
+	c, err := lc.ListenPacket(context.Background(), "udp", args.Listen)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create socket, %w", err)
 	}
