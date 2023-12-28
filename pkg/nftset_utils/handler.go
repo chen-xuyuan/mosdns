@@ -22,12 +22,18 @@
 package nftset_utils
 
 import (
+	"errors"
 	"fmt"
-	"github.com/google/nftables"
-	"go4.org/netipx"
 	"net/netip"
 	"sync"
 	"time"
+
+	"github.com/google/nftables"
+	"go4.org/netipx"
+)
+
+var (
+	ErrClosed = errors.New("closed handler")
 )
 
 // NftSetHandler can add netip.Prefix to the corresponding set.
@@ -35,45 +41,42 @@ import (
 // If the set has a 'interval' flag, the prefix from netip.Prefix will be
 // applied.
 type NftSetHandler struct {
-	opts  HandlerOpts
-	table *nftables.Table
+	opts HandlerOpts
 
-	m          sync.Mutex
-	lastUpdate time.Time
-	set        *nftables.Set
+	m           sync.Mutex
+	closed      bool
+	lastUpdate  time.Time
+	set         *nftables.Set
+	lastingConn *nftables.Conn // Note: lasting conn is not concurrent safe so m is required.
+
+	disableSetCache bool // for test only
 }
 
 type HandlerOpts struct {
-	Conn        *nftables.Conn // Required.
 	TableFamily nftables.TableFamily
-	TableName   string // Required
-	SetName     string // Required
+	TableName   string
+	SetName     string
 }
 
 // NewNtSetHandler inits NftSetHandler.
 func NewNtSetHandler(opts HandlerOpts) *NftSetHandler {
-	table := &nftables.Table{
-		Name:   opts.TableName,
-		Family: opts.TableFamily,
-	}
 	return &NftSetHandler{
-		opts:  opts,
-		table: table,
+		opts: opts,
 	}
 }
 
-// getSet get set info from kernel. It has an internal cache and won't
+// getSetLocked get set info from kernel. It has an internal cache and won't
 // invoke a syscall every time.
-func (h *NftSetHandler) getSet() (*nftables.Set, error) {
+func (h *NftSetHandler) getSetLocked() (*nftables.Set, error) {
 	const refreshInterval = time.Second
 
 	now := time.Now()
-	h.m.Lock()
-	defer h.m.Unlock()
-	if h.set != nil && now.Sub(h.lastUpdate) < refreshInterval {
+	if !h.disableSetCache && h.set != nil && now.Sub(h.lastUpdate) < refreshInterval {
 		return h.set, nil
 	}
-	set, err := h.opts.Conn.GetSetByName(h.table, h.opts.SetName)
+
+	// Note: GetSetByName is not concurrent safe.
+	set, err := h.lastingConn.GetSetByName(&nftables.Table{Name: h.opts.TableName, Family: h.opts.TableFamily}, h.opts.SetName)
 	if err != nil {
 		return nil, err
 	}
@@ -82,9 +85,24 @@ func (h *NftSetHandler) getSet() (*nftables.Set, error) {
 	return set, nil
 }
 
-// AddElems adds SetIPElem(s) to set in a single batch.
+// AddElems adds netip.Prefix(s) to set in a single batch.
 func (h *NftSetHandler) AddElems(es ...netip.Prefix) error {
-	set, err := h.getSet()
+	h.m.Lock()
+	defer h.m.Unlock()
+
+	if h.closed {
+		return ErrClosed
+	}
+
+	if h.lastingConn == nil {
+		c, err := nftables.New(nftables.AsLasting())
+		if err != nil {
+			return fmt.Errorf("failed to open netlink, %w", err)
+		}
+		h.lastingConn = c
+	}
+
+	set, err := h.getSetLocked()
 	if err != nil {
 		return fmt.Errorf("failed to get set, %w", err)
 	}
@@ -96,24 +114,41 @@ func (h *NftSetHandler) AddElems(es ...netip.Prefix) error {
 		elems = make([]nftables.SetElement, 0, len(es))
 	}
 
-	for _, e := range es {
+	for i, e := range es {
+		if !e.IsValid() {
+			return fmt.Errorf("invalid prefix at index %d", i)
+		}
 		if set.Interval {
-			r := netipx.RangeOfPrefix(e)
-			start := r.From()
-			end := r.To()
-			elems = append(
-				elems,
-				nftables.SetElement{Key: start.AsSlice(), IntervalEnd: false},
-				nftables.SetElement{Key: end.Next().AsSlice(), IntervalEnd: true},
-			)
+			start := e.Masked().Addr()
+			elems = append(elems, nftables.SetElement{Key: start.AsSlice(), IntervalEnd: false})
+			
+			end := netipx.PrefixLastIP(e).Next() // may be invalid if end is overflowed
+			if end.IsValid() {
+				elems = append(elems, nftables.SetElement{Key: end.AsSlice(), IntervalEnd: true})
+			}
 		} else {
 			elems = append(elems, nftables.SetElement{Key: e.Addr().AsSlice()})
 		}
 	}
 
-	err = h.opts.Conn.SetAddElements(set, elems)
+	err = h.lastingConn.SetAddElements(set, elems)
 	if err != nil {
 		return err
 	}
-	return h.opts.Conn.Flush()
+	return h.lastingConn.Flush()
+}
+
+func (h *NftSetHandler) Close() error {
+	h.m.Lock()
+	defer h.m.Unlock()
+
+	if h.closed {
+		return nil
+	}
+
+	h.closed = true
+	if h.lastingConn != nil {
+		return h.lastingConn.CloseLasting()
+	}
+	return nil
 }

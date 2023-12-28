@@ -39,7 +39,6 @@ type nftsetPlugin struct {
 	args  *Args
 	v4set *nftset_utils.NftSetHandler
 	v6set *nftset_utils.NftSetHandler
-	nc    *nftables.Conn
 }
 
 func newNftsetPlugin(bp *coremain.BP, args *Args) (*nftsetPlugin, error) {
@@ -50,15 +49,9 @@ func newNftsetPlugin(bp *coremain.BP, args *Args) (*nftsetPlugin, error) {
 		args.Mask6 = 32
 	}
 
-	nc, err := nftables.New(nftables.AsLasting())
-	if err != nil {
-		return nil, fmt.Errorf("failed to connecet netlink, %w", err)
-	}
-
 	nftPlugin := &nftsetPlugin{
 		BP:   bp,
 		args: args,
-		nc:   nc,
 	}
 
 	if len(args.TableFamily4) > 0 && len(args.TableName4) > 0 && len(args.SetName4) > 0 {
@@ -67,7 +60,6 @@ func newNftsetPlugin(bp *coremain.BP, args *Args) (*nftsetPlugin, error) {
 			return nil, fmt.Errorf("unsupported nftables family for set4 [%s]", args.TableFamily4)
 		}
 		nftPlugin.v4set = nftset_utils.NewNtSetHandler(nftset_utils.HandlerOpts{
-			Conn:        nc,
 			TableFamily: f,
 			TableName:   args.TableName4,
 			SetName:     args.SetName4,
@@ -80,7 +72,6 @@ func newNftsetPlugin(bp *coremain.BP, args *Args) (*nftsetPlugin, error) {
 			return nil, fmt.Errorf("unsupported nftables family for set6 [%s]", args.TableFamily6)
 		}
 		nftPlugin.v6set = nftset_utils.NewNtSetHandler(nftset_utils.HandlerOpts{
-			Conn:        nc,
 			TableFamily: f,
 			TableName:   args.TableName6,
 			SetName:     args.SetName6,
@@ -154,7 +145,13 @@ func (p *nftsetPlugin) addElems(r *dns.Msg) error {
 }
 
 func (p *nftsetPlugin) Close() error {
-	return p.nc.CloseLasting()
+	if p.v4set != nil {
+		_ = p.v4set.Close()
+	}
+	if p.v6set != nil {
+		_ = p.v6set.Close()
+	}
+	return nil
 }
 
 func parseTableFamily(s string) (nftables.TableFamily, bool) {
